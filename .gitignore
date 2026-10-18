@@ -1,0 +1,33 @@
+# Build products and local installers
+.build/
+*.app/
+*.pkg
+*.dmg
+*.zip
+Installers/
+DerivedData/
+
+# Local signing, authentication, and environment configuration
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.keychain
+*.keychain-db
+keychain-password
+HidecellSigning/
+AuthKey_*
+
+# Local diagnostics, preferences, and editor state
+Performance/
+Verification/
+*.log
+*.crash
+*.ips
+*.xcuserstate
+xcuserdata/
+.DS_Store
