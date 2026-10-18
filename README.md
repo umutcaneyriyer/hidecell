@@ -3,6 +3,28 @@
 A local macOS application for selecting which third-party menu bar icons to
 hide and arranging their order. Changes are applied with Save changes.
 
+## A closer look
+
+![Hidecell applications window on a violet satin wallpaper](docs/images/applications.png)
+
+### At home in the menu bar
+
+Hidecell lives alongside your macOS status icons. Click its menu bar icon to
+reveal or hide your saved selection.
+
+![Hidecell's purple icon in the macOS menu bar](docs/images/menu-bar.png)
+
+### Put your apps in order
+
+Choose Order applications, drag rows into place, and choose Save changes.
+Cancel leaves the saved order unchanged.
+
+![Hidecell's Order Applications view](docs/images/ordering.png)
+
+These are styled product illustrations based on actual application screenshots,
+with AI-assisted wallpaper and presentation edits. They are not unmodified
+screen captures; system icons and appearance may vary by macOS version.
+
 ## Requirements
 
 - Apple Silicon and macOS 27 or later for the current build configuration.
