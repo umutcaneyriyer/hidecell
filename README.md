@@ -12,6 +12,10 @@ hide and arranging their order. Changes are applied with Save changes.
 Hidecell lives alongside your macOS status icons. Click its menu bar icon to
 reveal or hide your saved selection.
 
+[Watch the menu bar demo (MP4, 15 seconds)](docs/videos/hidecell-menu-bar-demo.mp4)
+
+An unedited screen recording of Hidecell in use.
+
 ![Hidecell's purple icon in the macOS menu bar](docs/images/menu-bar.png)
 
 ### Put your apps in order
