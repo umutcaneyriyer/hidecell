@@ -33,8 +33,8 @@ screen captures; system icons and appearance may vary by macOS version.
 
 - Apple Silicon and macOS 27 or later for the current build configuration.
 - Xcode command-line developer tools with the macOS 27 SDK, plus Python 3.
-- Accessibility permission and explicit access to the menu preference files
-  requested by the application.
+- Accessibility permission; explicit access to the menu layout file when
+  changing icon order. Session-only hiding does not write visibility preferences.
 
 ## Development
 
@@ -80,3 +80,31 @@ Third-party license notices are retained in THIRD-PARTY-LICENSE.txt and Fonts/.
 No additional license grant has been selected for Hidecell's original code.
 Choose a project license before presenting this repository as open source.
 See THIRD-PARTY-NOTICES.md and SECURITY-REVIEW.md.
+
+### Legacy visibility recovery (1.5.13–1.5.15)
+
+Version 1.5.13 uses a session guardian for menu visibility writes. It restores original states on UI exit, force termination, or removal of the app executable, even if app preferences were deleted. It exits after recovery and installs no login agent. New hiding writes require a responsive guardian.
+
+Recovery cannot run if the guardian itself is forcibly killed (SIGKILL), the machine loses power, or macOS denies preference access. Saved recovery preferences can be used by the legacy recovery tooling when available. No application can guarantee cleanup when all its processes and recovery data are removed together.
+
+Run isolated crash/removal integration tests with:
+
+```sh
+xcrun swiftc -D RECOVERY_TESTING -module-cache-path .build/ModuleCache Sources/NativeVisibility.swift Sources/VisibilityGuardian.swift Tests/Recovery/main.swift -o .build/HidecellRecoveryTests
+python3 Tests/Recovery/integration.py
+```
+
+
+### Session-only visibility (1.5.16)
+
+New hiding sessions use a process-scoped macOS assertion rather than writing
+Control Center's persistent `isAllowed` settings. Normal quit invalidates it;
+macOS releases it on process death. A timer exits when the installed executable
+is removed. This uses a private macOS interface and fails open when unavailable.
+The older native-visibility code remains for recovery tooling and tests, not
+for the application's hiding path. Old releases may require restoration of
+their original preferences and a menu service refresh before migration.
+
+Live verification on the development Mac: toggle, normal quit, forced kill,
+and bundle removal by reversible rename. Direct CleanMyMac removal and the
+clock-click compatibility handler have not yet been verified end-to-end.

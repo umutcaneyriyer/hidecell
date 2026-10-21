@@ -27,6 +27,14 @@ enum IconPolicy {
         return url
     }
 
+    static func newlyDiscovered(groups: [String: Set<String>], known: Set<String>, ownID: String) -> Set<String> {
+        Set(groups.compactMap { id, owners in
+            guard id != ownID, !id.hasPrefix("com.apple."),
+                  known.isDisjoint(with: owners.union([id])) else { return nil }
+            return id
+        })
+    }
+
     static func keepOwner(hasExtras: Bool, confirmed: Bool, hidden: Bool, transientFailure: Bool) -> Bool {
         hasExtras || (confirmed && (hidden || transientFailure))
     }

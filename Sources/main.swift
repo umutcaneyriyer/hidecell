@@ -43,12 +43,21 @@ final class BarModel: ObservableObject {
     @Published var orderedIDs = UserDefaults.standard.stringArray(forKey: "iconOrder") ?? []
     let available = true
     private var verifiedOwners = Set(UserDefaults.standard.stringArray(forKey: "verifiedMenuOwners") ?? [])
+    private var knownMenuApps = Set(UserDefaults.standard.stringArray(forKey: "knownMenuApps")
+        ?? ((UserDefaults.standard.stringArray(forKey: "verifiedMenuOwners") ?? [])
+            + (UserDefaults.standard.stringArray(forKey: "hiddenApps") ?? [])))
     private var scanRevision = 0
     private var scanAgain = false
     private var refreshTimer: Timer?
     private var revision = 0
     private var observation: NSKeyValueObservation?
     private var presentationRevision = 0
+    private var clockInteraction = ClockInteraction()
+    private var clockSuspended = false
+    private var visibilityToken: AnyObject?
+    private var lastAllowed: Set<String>?
+    private var visibilityRevision = 0
+    private var removalTimer: Timer?
     private var diagnostics: [String] = []
     var onStateChange: (() -> Void)?
 
@@ -91,9 +100,12 @@ final class BarModel: ObservableObject {
     }
 
     func requestAccess() {
-        _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        // Open Settings directly; asking AX to show a modal at the same time
+        // leaves a second consent window covering the permission controls.
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
+            if !NSWorkspace.shared.open(url) {
+                error = "Open System Settings → Privacy & Security and enable Hidecell in Device Control and Data Access (Accessibility)."
+            }
         }
     }
 
@@ -119,21 +131,31 @@ final class BarModel: ObservableObject {
     }
 
     func startHiding() {
-        collapsed = true
-        visibilityNeedsAccess = !NativeVisibility.requestAccess(showPanel: false)
-        if !visibilityNeedsAccess { apply() }
+        visibilityNeedsAccess = false
+        guard AXIsProcessTrusted() else { return }
+        if removalTimer == nil {
+            clockInteraction.isHidden = { [weak self] in self?.visibilityToken != nil }
+            clockInteraction.reveal = { [weak self] in self?.clockSuspended = true; self?.reveal() }
+            clockInteraction.resume = { [weak self] in self?.clockSuspended = false; self?.apply() }
+            clockInteraction.start()
+            let executable = Bundle.main.executableURL
+            removalTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let executable, !FileManager.default.fileExists(atPath: executable.path) else { return }
+                self?.collapsed = false
+                self?.reveal()
+                NSApp.terminate(nil)
+            }
+        }
+        apply()
     }
 
-    func grantVisibilityAccess() {
-        visibilityNeedsAccess = !NativeVisibility.requestAccess()
-        if !visibilityNeedsAccess { apply() }
-    }
+    func grantVisibilityAccess() { requestAccess() }
 
     func exportDiagnostics() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "Hidecell-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let text = ["Hidecell V1 Node (1.5, build 10)", "Path: \(Bundle.main.bundlePath)",
+        let text = ["Hidecell V1 Node (1.5, build 16)", "Path: \(Bundle.main.bundlePath)",
                     "Login: \(SMAppService.mainApp.status.rawValue)", "AX trusted: \(AXIsProcessTrusted())",
                     "Collapsed: \(collapsed)", "Busy: \(busy)",
                     "Selected: \(selected.sorted().joined(separator: ", "))",
@@ -149,7 +171,11 @@ final class BarModel: ObservableObject {
 
     func refresh() {
         let access = AXIsProcessTrusted()
-        if trusted != access { trusted = access }
+        if trusted != access {
+            trusted = access
+            if access { startHiding() }
+            else { reveal() }
+        }
         guard trusted else {
             scanRevision += 1
             entries = []
@@ -171,19 +197,24 @@ final class BarModel: ObservableObject {
         let stateRevision = presentationRevision
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var found: [(String, URL)] = []
-            let menuOwners = Set(MenuLayout.snapshot().map(\.owner))
+            let nativeInventory = try? NativeVisibility.inventory()
+            let registry = nativeInventory ?? NativeVisibility.Inventory()
+            // AX traversal is an expensive fallback, not a mandatory polling step.
+            let menuOwners = nativeInventory == nil ? Set(MenuLayout.snapshot().map(\.owner)) : Set<String>()
             var verified = Set<String>()
             var details: [String] = []
             for (pid, id, url, parentID) in candidates {
                 let element = AXUIElementCreateApplication(pid)
                 AXUIElementSetMessagingTimeout(element, 0.2)
                 var value: CFTypeRef?
-                var result = AXUIElementCopyAttributeValue(element, kAXExtrasMenuBarAttribute as CFString, &value)
+                let registered = registry.owners.contains(id) || registry.owners.contains(parentID)
+                var result: AXError = .success
+                if !registered { result = AXUIElementCopyAttributeValue(element, kAXExtrasMenuBarAttribute as CFString, &value) }
                 if result == .cannotComplete {
                     AXUIElementSetMessagingTimeout(element, 0.6)
                     result = AXUIElementCopyAttributeValue(element, kAXExtrasMenuBarAttribute as CFString, &value)
                 }
-                let hasExtras = menuOwners.contains(id) || (result == .success && value.map { CFGetTypeID($0) == AXUIElementGetTypeID() } == true)
+                let hasExtras = registry.owners.contains(id) || registry.owners.contains(parentID) || menuOwners.contains(id) || (result == .success && value.map { CFGetTypeID($0) == AXUIElementGetTypeID() } == true)
                 // Some status-item providers expose AXExtrasMenuBar but not AXChildren.
                 // Requiring a positive child count incorrectly excluded those providers.
                 if hasExtras { verified.insert(id) }
@@ -214,6 +245,18 @@ final class BarModel: ObservableObject {
                     if groups[id] == nil { groups[id] = (root, []) }
                     groups[id]!.1.insert(owner)
                 }
+                let newApps = IconPolicy.newlyDiscovered(groups: groups.mapValues { $0.1 },
+                    known: self.knownMenuApps, ownID: Self.ownID)
+                if !newApps.isEmpty {
+                    self.selected.formUnion(newApps)
+                    // Preserve an in-progress edit when a provider appears mid-scan.
+                    if self.selectionDraft != nil { self.selectionDraft?.formUnion(newApps) }
+                    UserDefaults.standard.set(self.selected.sorted(), forKey: "hiddenApps")
+                    self.presentationRevision += 1
+                }
+                self.knownMenuApps.formUnion(groups.keys)
+                self.knownMenuApps.formUnion(groups.values.flatMap { $0.1 })
+                UserDefaults.standard.set(self.knownMenuApps.sorted(), forKey: "knownMenuApps")
                 let activePaths = Set(groups.values.map { $0.0.path })
                 self.iconCache = self.iconCache.filter { activePaths.contains($0.key) }
                 let updatedEntries = groups.map { id, group in
@@ -233,6 +276,18 @@ final class BarModel: ObservableObject {
                     $0.id != $1.id || $0.name != $1.name || $0.owners != $1.owners
                 }) {
                     self.entries = updatedEntries
+                }
+                // A provider can register its icon after the launch notification.
+                // Reapply only saved choices that macOS currently reports visible.
+                let identities = self.runningIdentities()
+                let hiddenParents = Set(identities.filter {
+                    self.selected.contains($0.owner) || self.selected.contains($0.parent)
+                }.map(\.parent))
+                let hiddenOwners = self.selected.union(identities.filter {
+                    hiddenParents.contains($0.parent)
+                }.flatMap { [$0.owner, $0.parent] })
+                if self.collapsed && (!newApps.isEmpty || !registry.allowedOwners.isDisjoint(with: hiddenOwners)) {
+                    self.apply()
                 }
                 if self.scanAgain { self.scanAgain = false; self.refresh() }
             }
@@ -354,23 +409,48 @@ final class BarModel: ObservableObject {
     }
 
     func reveal() {
-        do {
-            try NativeVisibility.apply(hidden: [])
-            busy = false
-        } catch { self.error = error.localizedDescription }
+        visibilityRevision += 1
+        STMenuBarShim.invalidate(visibilityToken)
+        visibilityToken = nil
+        lastAllowed = nil
+        busy = false
         onStateChange?()
     }
 
     func apply() {
-        guard !arranging, !visibilityNeedsAccess else { return }
-        let identities = runningIdentities()
-        let parents = Set(identities.filter { selected.contains($0.owner) || selected.contains($0.parent) }.map(\.parent))
-        let owners = Set(identities.filter { parents.contains($0.parent) }.flatMap { [$0.owner, $0.parent] })
-        do {
-            try NativeVisibility.apply(hidden: collapsed ? selected.union(owners) : [])
-            error = nil
-        } catch { self.error = error.localizedDescription }
-        busy = false
+        guard !arranging, !clockSuspended, AXIsProcessTrusted() else { return }
+        guard collapsed, !selected.isEmpty else { reveal(); return }
+        guard STMenuBarShim.isAvailable() else {
+            collapsed = false
+            reveal()
+            error = "Session-only hiding is unavailable on this macOS version. Icons were left visible."
+            return
+        }
+        let allowed = IconPolicy.allowlist(running: runningIdentities(), selected: selected, ownID: Self.ownID)
+        guard allowed != lastAllowed else { return }
+        reveal()
+        visibilityRevision += 1
+        let current = visibilityRevision
+        busy = true
+        error = nil
+        visibilityToken = STMenuBarShim.activate(withAllowedBundleIdentifiers: allowed.sorted(),
+            allowedSystemItems: (0...255).map { NSNumber(value: $0) }) { [weak self] failure in
+            DispatchQueue.main.async {
+                guard let self, self.visibilityRevision == current else { return }
+                self.busy = false
+                if let failure {
+                    self.collapsed = false
+                    self.reveal()
+                    self.error = failure.localizedDescription
+                }
+                self.onStateChange?()
+            }
+        } as AnyObject?
+        if visibilityToken == nil {
+            collapsed = false
+            reveal()
+            error = "Session-only hiding could not start. Icons were left visible."
+        } else { lastAllowed = allowed }
         onStateChange?()
     }
 
@@ -939,7 +1019,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
-    func applicationWillTerminate(_ notification: Notification) { model.reveal() }
+    func applicationWillTerminate(_ notification: Notification) {
+        model.reveal()
+    }
+}
+
+// Run before NSApplication setup and the single-instance check.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--visibility-guardian" {
+    signal(SIGPIPE, SIG_IGN)
+    VisibilityGuardian.run(bundlePath: CommandLine.arguments[2])
 }
 
 // Read-only diagnostic mode: no windows, input events or permission prompt.

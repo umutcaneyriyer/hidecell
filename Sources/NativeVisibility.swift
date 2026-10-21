@@ -3,8 +3,17 @@ import AppKit
 // Use Control Center's per-application visibility preferences, not assessment mode.
 // Only trackedApplications is written; unrelated Control Center settings stay intact.
 enum NativeVisibility {
+    #if RECOVERY_TESTING
+    static let url = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HIDECELL_TEST_DOMAIN"]! + ".plist")
+    #else
     static let url = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Group Containers/group.com.apple.controlcenter/Library/Preferences/group.com.apple.controlcenter.plist")
+    #endif
+    #if RECOVERY_TESTING
+    private static let recoveryDefaults = UserDefaults(suiteName: ProcessInfo.processInfo.environment["HIDECELL_TEST_DOMAIN"]! + ".recovery")!
+    #else
+    private static let recoveryDefaults = UserDefaults.standard
+    #endif
     private static var accessURL: URL?
     private static let backupKey = "nativeVisibilityOriginalStates"
     private static let preferenceKey = "trackedApplications"
@@ -35,9 +44,10 @@ enum NativeVisibility {
     }
 
     enum Failure: LocalizedError {
-        case unreadable, invalidFormat, writeFailed
+        case unreadable, invalidFormat, writeFailed, guardianUnavailable
         var errorDescription: String? {
             switch self {
+            case .guardianUnavailable: return "Icon recovery protection is unavailable. Icons were not hidden. Reopen Hidecell to try again."
             case .unreadable: return "Cannot access menu visibility settings. Reopen Hidecell and grant file access."
             case .invalidFormat: return "The macOS menu visibility format is not supported. Settings were not changed."
             case .writeFailed: return "Could not save menu visibility."
@@ -69,6 +79,33 @@ enum NativeVisibility {
         return rows
     }
 
+    struct Inventory {
+        var owners: Set<String> = []
+        var allowedOwners: Set<String> = []
+    }
+
+    // This registry also includes providers whose AX extras bar is unavailable.
+    // Callers intersect it with running applications, so old records are not listed.
+    static func inventory(from rows: [Any]) -> Inventory {
+        var result = Inventory()
+        guard rows.count.isMultiple(of: 2) else { return result }
+        for i in stride(from: 0, to: rows.count, by: 2) {
+            guard let key = rows[i] as? [String: Any],
+                  let bundle = key["bundle"] as? [String: Any],
+                  let id = bundle["_0"] as? String,
+                  let value = rows[i + 1] as? [String: Any] else { continue }
+            let locations = value["menuItemLocations"] as? [[String: Any]] ?? []
+            let owners = Set(locations.compactMap {
+                ($0["bundle"] as? [String: Any])?["_0"] as? String
+            }).union([id]).filter { !$0.hasPrefix("com.apple.") && $0 != "app.hidecell.Hidecell" }
+            result.owners.formUnion(owners)
+            if value["isAllowed"] as? Bool ?? true { result.allowedOwners.formUnion(owners) }
+        }
+        return result
+    }
+
+    static func inventory() throws -> Inventory { inventory(from: try readRows()) }
+
     // Preserve unknown records and metadata. Resolve helper owners through macOS's
     // own menuItemLocations mapping instead of inventing new preference records.
     static func update(_ rows: [Any], hidden: Set<String>, originals: inout [String: Bool]) throws -> [Any] {
@@ -94,23 +131,32 @@ enum NativeVisibility {
         return result
     }
 
+    private static var recoveryStates: [String: Bool]?
+
     static func apply(hidden: Set<String>) throws {
+        try VisibilityGuardian.apply(hidden: hidden)
+    }
+
+    static func applyDirect(hidden: Set<String>) throws {
         // No access is needed to restore if Hidecell has never changed this domain.
-        var originals = UserDefaults.standard.dictionary(forKey: backupKey) as? [String: Bool] ?? [:]
+        var originals = recoveryStates ?? (recoveryDefaults.dictionary(forKey: backupKey) as? [String: Bool] ?? [:])
         if hidden.isEmpty && originals.isEmpty { return }
         let recovery = originals
         let rows = try readRows()
         let updated = try update(rows, hidden: hidden, originals: &originals)
         let data = try PropertyListSerialization.data(fromPropertyList: updated, format: .binary, options: 0)
         guard !NSArray(array: rows).isEqual(to: updated) else {
-            UserDefaults.standard.set(originals, forKey: backupKey)
+            recoveryStates = originals
+            recoveryDefaults.set(originals, forKey: backupKey)
             return
         }
+        recoveryStates = recovery.merging(originals) { old, _ in old }
         // Persist recovery information before changing the system setting.
-        UserDefaults.standard.set(recovery.merging(originals) { old, _ in old }, forKey: backupKey)
+        recoveryDefaults.set(recovery.merging(originals) { old, _ in old }, forKey: backupKey)
         let hexadecimal = data.map { String(format: "%02x", $0) }.joined()
         _ = try preferences(["write", domain, preferenceKey, "-data", hexadecimal])
         guard NSArray(array: try readRows()).isEqual(to: updated) else { throw Failure.writeFailed }
-        UserDefaults.standard.set(originals, forKey: backupKey)
+        recoveryStates = originals
+            recoveryDefaults.set(originals, forKey: backupKey)
     }
 }
