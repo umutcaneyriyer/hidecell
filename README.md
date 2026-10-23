@@ -3,6 +3,14 @@
 A local macOS application for selecting which third-party menu bar icons to
 hide and arranging their order. Changes are applied with Save changes.
 
+## Download
+
+[Download for Mac (.dmg)](https://github.com/umutcaneyriyer/hidecell/releases/download/v1.5.19/Hidecell-1.5.19.dmg)
+
+Open the disk image and drag Hidecell into Applications. This is a development
+build with ad hoc signing, not Developer ID signed or notarized. macOS may require
+approval to open it and renewal of Accessibility permission after updating.
+
 ## A closer look
 
 ![Hidecell applications window on a violet satin wallpaper](docs/images/applications.png)
@@ -34,7 +42,7 @@ screen captures; system icons and appearance may vary by macOS version.
 - Apple Silicon and macOS 27 or later for the current build configuration.
 - Xcode command-line developer tools with the macOS 27 SDK, plus Python 3.
 - Accessibility permission; explicit access to the menu layout file when
-  changing icon order. Session-only hiding does not write visibility preferences.
+  changing icon order and native visibility settings.
 
 ## Development
 
@@ -42,6 +50,8 @@ screen captures; system icons and appearance may vary by macOS version.
 ./test.sh
 ./build.sh
 ./package.sh ./Installers
+# For the custom drag-to-Applications DMG, see Packaging/README.md.
+./package-dmg.sh
 ```
 
 The default build uses an ad hoc development signature. To use a certificate
@@ -95,16 +105,27 @@ python3 Tests/Recovery/integration.py
 ```
 
 
-### Session-only visibility (1.5.16)
+### Native visibility with session recovery (1.5.18)
 
-New hiding sessions use a process-scoped macOS assertion rather than writing
-Control Center's persistent `isAllowed` settings. Normal quit invalidates it;
-macOS releases it on process death. A timer exits when the installed executable
-is removed. This uses a private macOS interface and fails open when unavailable.
-The older native-visibility code remains for recovery tooling and tests, not
-for the application's hiding path. Old releases may require restoration of
-their original preferences and a menu service refresh before migration.
+Hiding uses per-application native visibility settings. It does not use assessment
+mode, intercept clock clicks, or reveal icons when the pointer approaches the clock.
+A launchd job is prepared before the first visibility change. Its recovery journal
+and executable are copied outside the app bundle and app preferences. On quit,
+process death, or executable removal it restores only the original managed states.
+launchd restarts the recovery process if it crashes. It removes itself after recovery;
+no login item or persistent LaunchAgents file is installed.
 
-Live verification on the development Mac: toggle, normal quit, forced kill,
-and bundle removal by reversible rename. Direct CleanMyMac removal and the
-clock-click compatibility handler have not yet been verified end-to-end.
+Recovery still requires access to the native preference domain. Power loss, logout
+before recovery, or removal of the recovery directory itself are not covered by this
+session job. This is not a claim that every third-party uninstaller was tested.
+
+Run the new isolated launchd integration tests with:
+
+```sh
+xcrun swiftc -D RECOVERY_TESTING -module-cache-path .build/ModuleCache Sources/NativeVisibility.swift Sources/VisibilityGuardian.swift Sources/SessionRecovery.swift Tests/SessionRecovery/main.swift -o .build/HidecellSessionTests
+python3 Tests/SessionRecovery/integration.py
+```
+
+Validated: normal termination, main-process kill, simultaneous main/helper kill,
+and executable plus app-preferences deletion, all against an isolated test domain.
+Live Notification Center and uninstall checks are recorded separately in CHANGELOG.md.

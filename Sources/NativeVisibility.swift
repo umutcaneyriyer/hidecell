@@ -132,6 +132,28 @@ enum NativeVisibility {
     }
 
     private static var recoveryStates: [String: Bool]?
+    static var recoveryJournal: URL?
+
+    private static func originalsFromDisk() throws -> [String: Bool] {
+        if let recoveryJournal, FileManager.default.fileExists(atPath: recoveryJournal.path) {
+            let object = try PropertyListSerialization.propertyList(from: Data(contentsOf: recoveryJournal), format: nil)
+            guard let states = object as? [String: Bool] else { throw Failure.invalidFormat }
+            return states
+        }
+        return recoveryDefaults.dictionary(forKey: backupKey) as? [String: Bool] ?? [:]
+    }
+
+    private static func persist(_ originals: [String: Bool]) throws {
+        if let recoveryJournal {
+            let data = try PropertyListSerialization.data(fromPropertyList: originals, format: .binary, options: 0)
+            try data.write(to: recoveryJournal, options: .atomic)
+        }
+        recoveryDefaults.set(originals, forKey: backupKey)
+    }
+
+    static func saveRecoveryJournal() throws {
+        try persist(recoveryStates ?? originalsFromDisk())
+    }
 
     static func apply(hidden: Set<String>) throws {
         try VisibilityGuardian.apply(hidden: hidden)
@@ -139,7 +161,7 @@ enum NativeVisibility {
 
     static func applyDirect(hidden: Set<String>) throws {
         // No access is needed to restore if Hidecell has never changed this domain.
-        var originals = recoveryStates ?? (recoveryDefaults.dictionary(forKey: backupKey) as? [String: Bool] ?? [:])
+        var originals = try recoveryStates ?? originalsFromDisk()
         if hidden.isEmpty && originals.isEmpty { return }
         let recovery = originals
         let rows = try readRows()
@@ -147,16 +169,16 @@ enum NativeVisibility {
         let data = try PropertyListSerialization.data(fromPropertyList: updated, format: .binary, options: 0)
         guard !NSArray(array: rows).isEqual(to: updated) else {
             recoveryStates = originals
-            recoveryDefaults.set(originals, forKey: backupKey)
+            try persist(originals)
             return
         }
         recoveryStates = recovery.merging(originals) { old, _ in old }
         // Persist recovery information before changing the system setting.
-        recoveryDefaults.set(recovery.merging(originals) { old, _ in old }, forKey: backupKey)
+        try persist(recovery.merging(originals) { old, _ in old })
         let hexadecimal = data.map { String(format: "%02x", $0) }.joined()
         _ = try preferences(["write", domain, preferenceKey, "-data", hexadecimal])
         guard NSArray(array: try readRows()).isEqual(to: updated) else { throw Failure.writeFailed }
         recoveryStates = originals
-            recoveryDefaults.set(originals, forKey: backupKey)
+        try persist(originals)
     }
 }

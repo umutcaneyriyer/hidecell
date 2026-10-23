@@ -52,10 +52,9 @@ final class BarModel: ObservableObject {
     private var revision = 0
     private var observation: NSKeyValueObservation?
     private var presentationRevision = 0
-    private var clockInteraction = ClockInteraction()
-    private var clockSuspended = false
-    private var visibilityToken: AnyObject?
-    private var lastAllowed: Set<String>?
+    private let visibilityQueue = DispatchQueue(label: "app.hidecell.visibility", qos: .userInitiated)
+    private var visibilityInFlight = false
+    private var pendingVisibility: Set<String>?
     private var visibilityRevision = 0
     private var removalTimer: Timer?
     private var diagnostics: [String] = []
@@ -131,31 +130,30 @@ final class BarModel: ObservableObject {
     }
 
     func startHiding() {
-        visibilityNeedsAccess = false
         guard AXIsProcessTrusted() else { return }
+        visibilityNeedsAccess = !NativeVisibility.requestAccess(showPanel: false)
         if removalTimer == nil {
-            clockInteraction.isHidden = { [weak self] in self?.visibilityToken != nil }
-            clockInteraction.reveal = { [weak self] in self?.clockSuspended = true; self?.reveal() }
-            clockInteraction.resume = { [weak self] in self?.clockSuspended = false; self?.apply() }
-            clockInteraction.start()
             let executable = Bundle.main.executableURL
             removalTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let executable, !FileManager.default.fileExists(atPath: executable.path) else { return }
                 self?.collapsed = false
-                self?.reveal()
                 NSApp.terminate(nil)
             }
         }
         apply()
     }
 
-    func grantVisibilityAccess() { requestAccess() }
+    func grantVisibilityAccess() {
+        guard AXIsProcessTrusted() else { requestAccess(); return }
+        visibilityNeedsAccess = !NativeVisibility.requestAccess()
+        apply()
+    }
 
     func exportDiagnostics() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "Hidecell-diagnostics.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let text = ["Hidecell V1 Node (1.5, build 16)", "Path: \(Bundle.main.bundlePath)",
+        let text = ["Hidecell V1 Node (1.5, build 19)", "Path: \(Bundle.main.bundlePath)",
                     "Login: \(SMAppService.mainApp.status.rawValue)", "AX trusted: \(AXIsProcessTrusted())",
                     "Collapsed: \(collapsed)", "Busy: \(busy)",
                     "Selected: \(selected.sorted().joined(separator: ", "))",
@@ -408,50 +406,40 @@ final class BarModel: ObservableObject {
         refresh()
     }
 
-    func reveal() {
+    func reveal() { enqueueVisibility([]) }
+
+    private func enqueueVisibility(_ hidden: Set<String>) {
         visibilityRevision += 1
-        STMenuBarShim.invalidate(visibilityToken)
-        visibilityToken = nil
-        lastAllowed = nil
-        busy = false
-        onStateChange?()
+        pendingVisibility = hidden
+        busy = true
+        drainVisibility()
+    }
+
+    private func drainVisibility() {
+        guard !visibilityInFlight, let hidden = pendingVisibility else { return }
+        pendingVisibility = nil
+        visibilityInFlight = true
+        let revision = visibilityRevision
+        visibilityQueue.async { [weak self] in
+            let failure: String?
+            do { try SessionRecovery.apply(hidden: hidden); failure = nil }
+            catch { failure = error.localizedDescription }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.visibilityInFlight = false
+                if revision == self.visibilityRevision { self.error = failure }
+                if self.pendingVisibility != nil { self.drainVisibility() }
+                else { self.busy = false; self.onStateChange?() }
+            }
+        }
     }
 
     func apply() {
-        guard !arranging, !clockSuspended, AXIsProcessTrusted() else { return }
-        guard collapsed, !selected.isEmpty else { reveal(); return }
-        guard STMenuBarShim.isAvailable() else {
-            collapsed = false
-            reveal()
-            error = "Session-only hiding is unavailable on this macOS version. Icons were left visible."
-            return
-        }
-        let allowed = IconPolicy.allowlist(running: runningIdentities(), selected: selected, ownID: Self.ownID)
-        guard allowed != lastAllowed else { return }
-        reveal()
-        visibilityRevision += 1
-        let current = visibilityRevision
-        busy = true
-        error = nil
-        visibilityToken = STMenuBarShim.activate(withAllowedBundleIdentifiers: allowed.sorted(),
-            allowedSystemItems: (0...255).map { NSNumber(value: $0) }) { [weak self] failure in
-            DispatchQueue.main.async {
-                guard let self, self.visibilityRevision == current else { return }
-                self.busy = false
-                if let failure {
-                    self.collapsed = false
-                    self.reveal()
-                    self.error = failure.localizedDescription
-                }
-                self.onStateChange?()
-            }
-        } as AnyObject?
-        if visibilityToken == nil {
-            collapsed = false
-            reveal()
-            error = "Session-only hiding could not start. Icons were left visible."
-        } else { lastAllowed = allowed }
-        onStateChange?()
+        guard !arranging, !visibilityNeedsAccess, AXIsProcessTrusted() else { return }
+        let identities = runningIdentities()
+        let allowed = IconPolicy.allowlist(running: identities, selected: selected, ownID: Self.ownID)
+        let owners = Set(identities.flatMap { [$0.owner, $0.parent] }).subtracting(allowed)
+        enqueueVisibility(collapsed ? selected.union(owners) : [])
     }
 
 }
@@ -706,6 +694,39 @@ struct HeaderActionStyle: ButtonStyle {
     }
 }
 
+// Permission prompts share the same action component as Save and Order.
+struct PermissionPrompt: View {
+    let title: String
+    let message: String
+    let actionTitle: String
+    let actionIcon: String
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.custom("Inter-Regular", size: 14))
+                    .foregroundStyle(BrandTheme.text)
+                Text(message)
+                    .font(.custom("Inter-Regular", size: 13))
+                    .foregroundStyle(BrandTheme.text.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(3)
+            }
+            Button(action: action) {
+                Label(actionTitle, systemImage: actionIcon)
+            }
+            .buttonStyle(HeaderActionStyle(emphasized: true, iconOnly: false))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 12).fill(BrandTheme.surface))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(BrandTheme.accent.opacity(0.1), lineWidth: 1))
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: BarModel
     @FocusState private var searchFocused: Bool
@@ -789,12 +810,14 @@ struct SettingsView: View {
                 if changed { closeSearch() }
             }
             if !model.trusted {
-                VStack(spacing: 12) {
-                    Text("Menu icon access").font(.headline)
-                    Text("Allow Hidecell in Accessibility to list your menu bar apps.")
-                        .foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Button("Open System Settings") { model.requestAccess() }.buttonStyle(.borderedProminent)
-                }.frame(maxWidth: .infinity, maxHeight: .infinity).padding(24)
+                PermissionPrompt(
+                    title: "Menu icon access",
+                    message: "Allow Hidecell in System Settings to manage your menu bar icons.",
+                    actionTitle: "Open System Settings",
+                    actionIcon: "gearshape",
+                    action: model.requestAccess
+                )
+                .frame(maxHeight: .infinity, alignment: .top)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
@@ -838,11 +861,14 @@ struct SettingsView: View {
                     Text("Applying order…").font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if model.visibilityNeedsAccess {
-                Text("Allow access to macOS menu settings once to hide icons.")
-                    .font(.caption).foregroundStyle(.secondary)
-                Button("Allow Menu Settings Access") { model.grantVisibilityAccess() }
-                    .buttonStyle(.borderedProminent)
+            if model.trusted && model.visibilityNeedsAccess {
+                PermissionPrompt(
+                    title: "Menu settings access",
+                    message: "Allow access to macOS menu settings to hide and restore your icons.",
+                    actionTitle: "Allow access",
+                    actionIcon: "folder",
+                    action: model.grantVisibilityAccess
+                )
             }
             if let error = model.error { Text(error).font(.caption).foregroundStyle(.red) }
         }
@@ -926,7 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mainMenu = NSMenu()
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "Quit Hidecell", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        // Quit is intentionally available only in the status-item menu.
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
         let editItem = NSMenuItem()
@@ -1018,10 +1044,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         layoutWindowControls()
         NSApp.activate(ignoringOtherApps: true)
     }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showSettings(); return true }
     func applicationWillTerminate(_ notification: Notification) {
-        model.reveal()
+        // The launchd recovery job restores after this process exits.
     }
+}
+
+if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--session-recovery",
+   let pid = Int32(CommandLine.arguments[2]) {
+    SessionRecovery.run(parent: pid, executable: CommandLine.arguments[3], directory: CommandLine.arguments[4])
 }
 
 // Run before NSApplication setup and the single-instance check.
@@ -1044,7 +1076,7 @@ if let other = NSWorkspace.shared.runningApplications.first(where: {
     other.activate(options: [.activateAllWindows])
     exit(0)
 }
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()

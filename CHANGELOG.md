@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.19 — 2026-10-24
+
+- Reuse the existing header action button style for both permission prompts.
+- Share prompt typography, spacing and surface styling; show menu-file access only after Accessibility access.
+- Add a Retina drag-to-Applications DMG with a custom lavender background and reproducible packaging script.
+- Verify the installed build recognizes permissions and hides selected icons.
+
+## 1.5.18 — 2026-10-24
+
+- Remove assessment-based hiding and all hover/clock interaction workarounds. Use native per-application visibility.
+- Start an independent launchd recovery job before hiding; persist original states outside the application and its preferences. Restart recovery on helper crashes and remove the session job after restoration.
+- Stop the main writer before restoring after executable removal, preventing an in-flight hide from overwriting restoration.
+- Preserve the menu-bar-only lifecycle and background operation after Command-W.
+- 46 policy tests and four isolated launchd recovery scenarios pass. On the development Mac, Command-W keeps hiding active; SIGKILL and reversible removal of the installed bundle both restore icons. A subsequent user check reported normal operation; CleanMyMac itself was not used in the removal test.
+
+## 1.5.17 — 2026-10-23
+
+- Run as an accessory menu-bar app with LSUIElement enabled, without a Dock icon.
+- Keep the process alive after closing the management window; expose Quit only in the status-item menu.
+- Remove event interception and synthetic clock-click replay. Suspend hiding while the pointer approaches the clock and while Notification Center is visible.
+- Refresh clock bounds off the main thread instead of retaining a stale position.
+- Build and 46 policy tests pass. Accessibility renewal completed; the process and status item remain available after Command-W. Native clock clicks require manual verification because the UI automation tool cannot target the system clock window.
+
 ## 1.5.16 — 2026-10-22
 
 - Replace persistent icon-visibility writes with a process-scoped menu assertion. No guardian process is used for new hiding sessions.
